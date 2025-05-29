@@ -1,0 +1,9 @@
+{
+    "app": {
+        "night_driving_start_hour": 23,
+        "night_driving_end_hour": 5,
+        "continuous_driving_threshold": 240,
+        "rest_threshold_minutes": 15,
+        "daily_driving_limit": 600
+    }
+}
