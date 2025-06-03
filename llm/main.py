@@ -58,6 +58,10 @@ class RestRecommendation(BaseModel):
     needs_rest: bool  # 是否需要休息
     reason: str  # 需要休息的原因
     recommendation: str  # 具体休息建议
+    fatigue_level: Optional[str] = None  # 疲劳等级（轻度/中度/重度/正常）
+    who_standard_advice: Optional[str] = None  # WHO标准建议
+    rest_methods: Optional[list] = None  # 具体休息方法列表（仅LLM模式）
+    duration_advice: Optional[str] = None  # 休息时长建议（仅LLM模式）
 
 class DriverAnalysis(BaseModel):
     """驾驶员分析结果"""
@@ -97,9 +101,9 @@ def calculate_night_driving_minutes(trips):
     
     return night_minutes
 
-def find_continuous_driving(trips, rest_threshold_minutes=15):
+def find_continuous_driving(trips, rest_threshold_minutes=20):
     """
-    查找连续驾驶且休息不足的事件
+    查找连续驾驶且休息不足的事件（根据WHO标准，休息时长<20分钟视为连续驾驶）
     返回值: 连续驾驶事件数量和最长连续驾驶时间（分钟）
     """
     if not trips:
@@ -134,13 +138,83 @@ def find_continuous_driving(trips, rest_threshold_minutes=15):
     for start, end in continuous_segments:
         duration_minutes = (end - start) / 60
         
-        # 如果连续驾驶超过4小时（240分钟），则计为一次事件
-        if duration_minutes > 240:
+        # 如果连续驾驶超过3小时（180分钟），则计为一次事件
+        if duration_minutes > 180:
             continuous_incidents += 1
             
         longest_duration = max(longest_duration, duration_minutes)
     
     return continuous_incidents, longest_duration
+
+def assess_fatigue_level(continuous_driving_minutes: float, daily_driving_minutes: float, night_driving_minutes: float) -> tuple:
+    """
+    根据WHO疲劳驾驶指标评估疲劳等级
+    
+    Args:
+        continuous_driving_minutes: 连续驾驶时长(分钟)
+        daily_driving_minutes: 日累计驾驶时长(分钟)
+        night_driving_minutes: 夜间驾驶时长(分钟)
+    
+    Returns:
+        tuple: (疲劳等级, 休息建议)
+    """
+    # 转换为小时便于判断
+    continuous_hours = continuous_driving_minutes / 60
+    daily_hours = daily_driving_minutes / 60
+    night_hours = night_driving_minutes / 60
+    
+    # 重度疲劳：连续驾驶>6小时 且 夜间驾驶>2小时
+    if continuous_hours > 6 and night_hours > 2:
+        return "重度", "停止驾驶，至少休息1小时"
+    
+    # 中度疲劳：连续驾驶>4小时 或 日累计驾驶>8小时
+    if continuous_hours > 4 or daily_hours > 8:
+        return "中度", "立即休息至少30分钟"
+    
+    # 轻度疲劳：连续驾驶3~4小时
+    if 3 <= continuous_hours <= 4:
+        return "轻度", "建议休息至少15分钟"
+    
+    # 无疲劳
+    return "正常", "继续安全驾驶，注意适时休息"
+
+def generate_rest_methods_by_level(fatigue_level: str) -> list:
+    """
+    根据疲劳等级生成休息方法建议
+    """
+    base_methods = [
+        "下车进行5-10分钟步行，活动筋骨缓解久坐疲劳",
+        "做颈部和肩部伸展运动，缓解驾驶姿势造成的肌肉紧张",
+        "适量饮用温水，补充水分保持身体状态"
+    ]
+    
+    if fatigue_level == "轻度":
+        return base_methods + [
+            "用冷水洗脸或湿毛巾敷眼部，提神醒脑恢复注意力",
+            "在车内播放轻松音乐，进行3-5分钟深呼吸放松"
+        ]
+    elif fatigue_level == "中度":
+        return base_methods + [
+            "用冷水洗脸或湿毛巾敷眼部，提神醒脑恢复注意力",
+            "在车内播放轻松音乐，进行5-10分钟深呼吸放松",
+            "避免大量咖啡因摄入，可适量食用健康零食补充能量",
+            "调节座椅到舒适位置，开窗通风保持空气流通"
+        ]
+    elif fatigue_level == "重度":
+        return [
+            "立即停车到安全地点，避免继续驾驶",
+            "进行至少15-20分钟的步行活动，充分放松身体",
+            "寻找舒适地点进行短时间休息或小憩",
+            "联系家人或朋友，考虑换人驾驶或改用其他交通方式",
+            "如条件允许，建议休息1-2小时后再继续驾驶",
+            "避免依赖咖啡因强行提神，优先保证充分休息"
+        ]
+    else:  # 正常
+        return [
+            "保持良好的驾驶习惯，每2小时主动休息15分钟",
+            "适时饮水，保持身体水分平衡", 
+            "注意观察自身状态，如有疲劳感及时休息"
+        ]
 
 @app.get("/", 
     summary="API根路径",
@@ -344,49 +418,58 @@ def get_rest_recommendation(
             
             if "error" in llm_response:
                 raise HTTPException(status_code=500, detail=llm_response["error"])
-            
-            # 返回LLM生成的建议
+              # 返回LLM生成的建议
             return RestRecommendation(
                 needs_rest=llm_response.get("needs_rest", False),
-                reason="由LLM分析得出",
-                recommendation=llm_response.get("recommendation", "")
+                reason="由LLM基于WHO疲劳驾驶指标分析得出",
+                recommendation=llm_response.get("recommendation", ""),
+                fatigue_level=llm_response.get("fatigue_level", "未评估"),
+                who_standard_advice=llm_response.get("duration_advice", ""),                rest_methods=llm_response.get("rest_methods", []),
+                duration_advice=llm_response.get("duration_advice", "")
             )
     
     else:
-        # 使用规则引擎提供建议
-        needs_rest = False
-        reason = "当前不需要立即休息"
-        recommendation = "可以继续保持正常的驾驶模式"
+        # 使用基于WHO疲劳驾驶指标的规则引擎
         
-        if continuous_incidents > 0:
+        # 计算最近24小时内的连续驾驶和夜间驾驶时长
+        recent_continuous_driving = longest_continuous
+        recent_night_driving = calculate_night_driving_minutes([t for t in trips if t.begin_time >= recent_time])
+        
+        # 评估疲劳等级
+        fatigue_level, who_advice = assess_fatigue_level(
+            continuous_driving_minutes=recent_continuous_driving,
+            daily_driving_minutes=recent_driving_time_minutes,
+            night_driving_minutes=recent_night_driving
+        )
+        
+        # 根据疲劳等级设置休息建议
+        if fatigue_level == "重度":
             needs_rest = True
-            reason = f"您有 {continuous_incidents} 次连续驾驶超过4小时的记录"
-            recommendation = "建议每连续驾驶2小时后至少休息15分钟"
-        
-        if recent_driving_time_minutes > 600:  # 最近24小时内驾驶超过10小时
+            reason = f"根据WHO标准，您的疲劳等级为重度（连续驾驶{round(recent_continuous_driving/60, 1)}小时，夜间驾驶{round(recent_night_driving/60, 1)}小时）"
+            recommendation = who_advice
+        elif fatigue_level == "中度":
             needs_rest = True
-            reason = f"您在过去24小时内已驾驶 {round(recent_driving_time_minutes/60, 1)} 小时，超出建议限制"
-            recommendation = "建议在继续驾驶前休息至少8小时"
+            if recent_continuous_driving > 240:  # 连续驾驶>4小时
+                reason = f"根据WHO标准，您的疲劳等级为中度（连续驾驶{round(recent_continuous_driving/60, 1)}小时）"
+            else:
+                reason = f"根据WHO标准，您的疲劳等级为中度（日累计驾驶{round(recent_driving_time_minutes/60, 1)}小时）"
+            recommendation = who_advice
+        elif fatigue_level == "轻度":
+            needs_rest = True
+            reason = f"根据WHO标准，您的疲劳等级为轻度（连续驾驶{round(recent_continuous_driving/60, 1)}小时）"
+            recommendation = who_advice
+        else:
+            needs_rest = False
+            reason = "根据WHO标准，当前疲劳等级正常"
+            recommendation = who_advice
         
-        if night_driving_percentage > 40:  # 夜间驾驶比例较高
-            if not needs_rest:
-                needs_rest = True
-                reason = f"夜间驾驶比例较高 ({round(night_driving_percentage, 1)}%)"
-            recommendation += "。建议调整您的驾驶时间，减少夜间驾驶（23:00-5:00）"
-        
-        # 检查当前是否在深夜驾驶
-        current_hour = current_dt.hour
-        if 1 <= current_hour <= 4:  # 深夜/凌晨时段
-            if recent_driving_time_minutes > 120:  # 在深夜已驾驶超过2小时
-                needs_rest = True
-                reason = "在高疲劳时段（凌晨1点至4点）长时间驾驶"
-                recommendation = "建议立即休息至少20分钟，或考虑停车休息睡眠"
-        
-        # 返回规则引擎生成的建议
+        # 返回包含WHO标准的休息建议
         return RestRecommendation(
             needs_rest=needs_rest,
             reason=reason,
-            recommendation=recommendation
+            recommendation=recommendation,
+            fatigue_level=fatigue_level,
+            who_standard_advice=who_advice
         )
 
 @app.get("/driver-analysis/", response_model=DriverAnalysis)
@@ -454,50 +537,60 @@ def get_driver_analysis(
         
         # 调用LLM生成建议
         llm_response = llm_service.get_rest_recommendation(driver_data, streaming=False)
-        
         if "error" in llm_response:
             raise HTTPException(status_code=500, detail=llm_response["error"])
         
         # 设置LLM生成的建议
         rest_recommendation = RestRecommendation(
             needs_rest=llm_response.get("needs_rest", False),
-            reason="由LLM分析得出",
-            recommendation=llm_response.get("recommendation", "")
+            reason="由LLM基于WHO疲劳驾驶指标分析得出",
+            recommendation=llm_response.get("recommendation", ""),
+            fatigue_level=llm_response.get("fatigue_level", "未评估"),
+            who_standard_advice=llm_response.get("duration_advice", ""),
+            rest_methods=llm_response.get("rest_methods", []),
+            duration_advice=llm_response.get("duration_advice", "")
         )
     else:
-        # 使用规则引擎提供建议
-        needs_rest = False
-        reason = "当前不需要立即休息"
-        recommendation = "可以继续保持正常的驾驶模式"
+        # 使用基于WHO疲劳驾驶指标的规则引擎
         
-        if continuous_incidents > 0:
+        # 计算最近24小时内的连续驾驶和夜间驾驶时长
+        recent_continuous_driving = longest_continuous
+        recent_night_driving = calculate_night_driving_minutes([t for t in trips if t.begin_time >= recent_time])
+        
+        # 评估疲劳等级
+        fatigue_level, who_advice = assess_fatigue_level(
+            continuous_driving_minutes=recent_continuous_driving,
+            daily_driving_minutes=recent_driving_time_minutes,
+            night_driving_minutes=recent_night_driving
+        )
+        
+        # 根据疲劳等级设置休息建议
+        if fatigue_level == "重度":
             needs_rest = True
-            reason = f"您有 {continuous_incidents} 次连续驾驶超过4小时的记录"
-            recommendation = "建议每连续驾驶2小时后至少休息15分钟"
-        
-        if recent_driving_time_minutes > 600:  # 最近24小时内驾驶超过10小时
+            reason = f"根据WHO标准，您的疲劳等级为重度（连续驾驶{round(recent_continuous_driving/60, 1)}小时，夜间驾驶{round(recent_night_driving/60, 1)}小时）"
+            recommendation = who_advice
+        elif fatigue_level == "中度":
             needs_rest = True
-            reason = f"您在过去24小时内已驾驶 {round(recent_driving_time_minutes/60, 1)} 小时，超出建议限制"
-            recommendation = "建议在继续驾驶前休息至少8小时"
-        
-        if night_driving_percentage > 40:  # 夜间驾驶比例较高
-            if not needs_rest:
-                needs_rest = True
-                reason = f"夜间驾驶比例较高 ({round(night_driving_percentage, 1)}%)"
-            recommendation += "。建议调整您的驾驶时间，减少夜间驾驶（23:00-5:00）"
-        
-        # 检查当前是否在深夜驾驶
-        current_hour = current_dt.hour
-        if 1 <= current_hour <= 4:  # 深夜/凌晨时段
-            if recent_driving_time_minutes > 120:  # 在深夜已驾驶超过2小时
-                needs_rest = True
-                reason = "在高疲劳时段（凌晨1点至4点）长时间驾驶"
-                recommendation = "建议立即休息至少20分钟，或考虑停车休息睡眠"
+            if recent_continuous_driving > 240:  # 连续驾驶>4小时
+                reason = f"根据WHO标准，您的疲劳等级为中度（连续驾驶{round(recent_continuous_driving/60, 1)}小时）"
+            else:
+                reason = f"根据WHO标准，您的疲劳等级为中度（日累计驾驶{round(recent_driving_time_minutes/60, 1)}小时）"
+            recommendation = who_advice
+        elif fatigue_level == "轻度":
+            needs_rest = True
+            reason = f"根据WHO标准，您的疲劳等级为轻度（连续驾驶{round(recent_continuous_driving/60, 1)}小时）"
+            recommendation = who_advice
+        else:
+            needs_rest = False
+            reason = "根据WHO标准，当前疲劳等级正常"
+            recommendation = who_advice
                 
         rest_recommendation = RestRecommendation(
             needs_rest=needs_rest,
             reason=reason,
-            recommendation=recommendation
+            recommendation=recommendation,
+            fatigue_level=fatigue_level,
+            who_standard_advice=who_advice
         )
     
     # 返回完整的分析结果
